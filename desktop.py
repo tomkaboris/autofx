@@ -18,7 +18,7 @@ from PySide6.QtCore import QThread, Qt, Signal
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel,
-    QInputDialog, QLineEdit, QMainWindow, QMessageBox, QPushButton, QStackedWidget, QTableWidget,
+    QInputDialog, QLineEdit, QMainWindow, QMessageBox, QPushButton, QSpinBox, QStackedWidget, QTableWidget,
     QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
 )
 from serial.tools import list_ports
@@ -27,6 +27,7 @@ from obd_ai.adapter import DemoAdapter, Elm327Adapter
 from obd_ai.ai_mechanic import answer, diagnostic_context
 from obd_ai.profiles import PROFILES, profile_for_question
 from obd_ai.service_operations import CONFIRMATION_TEXT, OperationDenied, operation_description, validate_clear_request
+from obd_ai.parameters import DEFINITIONS, DemoParameterStore, ParameterError
 
 BG = "#0b111b"
 PANEL = "#141e2c"
@@ -221,6 +222,7 @@ class AutoFX(QMainWindow):
         self.last_sample = None
         self.current_codes = []
         self.last_scan = None
+        self.parameter_store = DemoParameterStore()
         self.last_sample_received = 0.0
         self.history = deque(maxlen=90)
         self.tick = 0
@@ -246,7 +248,7 @@ class AutoFX(QMainWindow):
         nav.addWidget(label("AUTOMOTIVE DIAGNOSTICS", 9, MUTED, True))
         nav.addSpacing(30)
         self.nav_buttons = []
-        for name in ("Overview", "Diagnostics", "Sessions", "AI Assistant"):
+        for name in ("Overview", "Diagnostics", "Parameters", "Sessions", "AI Assistant"):
             b = QPushButton(name)
             b.setProperty("nav", True)
             b.setCursor(Qt.PointingHandCursor)
@@ -299,6 +301,7 @@ class AutoFX(QMainWindow):
         self.pages = QStackedWidget()
         self.pages.addWidget(self.overview_page())
         self.pages.addWidget(self.diagnostics_page())
+        self.pages.addWidget(self.parameters_page())
         self.pages.addWidget(self.sessions_page())
         self.pages.addWidget(self.ai_page())
         layout.addWidget(self.pages, 1)
@@ -429,7 +432,7 @@ class AutoFX(QMainWindow):
         code = self.current_codes[row]
         question = ("Objasni DTC " + str(code.get("code", "")) +
                     " i njegove moguće uzroke. Predloži bezbedne servisne provere pre brisanja.")
-        self.show_page(3)
+        self.show_page(4)
         self.start_analysis(question)
 
     def toggle_demo_engine(self, enabled):
@@ -491,6 +494,124 @@ class AutoFX(QMainWindow):
             QMessageBox.warning(self, "Service result", message)
         else:
             QMessageBox.information(self, "Service result", message)
+
+    def parameters_page(self):
+        page = QWidget()
+        main = QVBoxLayout(page)
+        main.setContentsMargins(0, 0, 0, 0)
+        main.setSpacing(15)
+        main.addWidget(label("ECU Parameter Management", 19, FG, True))
+        description = label(
+            "LAB SIMULATION ONLY: parameter changes in this screen never reach a physical ECU.", 11, ORANGE
+        )
+        description.setWordWrap(True)
+        main.addWidget(description)
+
+        form = panel()
+        layout = QVBoxLayout(form)
+        layout.addWidget(label("SIMULATED ECU PARAMETERS", 10, MUTED, True))
+        controls = QHBoxLayout()
+        controls.addWidget(label("Parameter", 11, MUTED))
+        self.parameter_select = QComboBox()
+        for key, item in DEFINITIONS.items():
+            self.parameter_select.addItem(item.name, key)
+        self.parameter_select.currentIndexChanged.connect(self.update_parameter_panel)
+        controls.addWidget(self.parameter_select, 1)
+        layout.addLayout(controls)
+        self.parameter_info = label("", 11, MUTED)
+        self.parameter_info.setWordWrap(True)
+        layout.addWidget(self.parameter_info)
+        self.parameter_current = label("Current: —", 22, FG, True)
+        layout.addWidget(self.parameter_current)
+        editor = QHBoxLayout()
+        editor.addWidget(label("Proposed value", 11, MUTED))
+        self.parameter_value = QSpinBox()
+        self.parameter_value.setMinimumWidth(130)
+        editor.addWidget(self.parameter_value)
+        self.parameter_preview = QPushButton("Preview")
+        self.parameter_preview.clicked.connect(self.preview_parameter)
+        editor.addWidget(self.parameter_preview)
+        self.parameter_apply = QPushButton("Apply in simulator")
+        self.parameter_apply.setObjectName("primary")
+        self.parameter_apply.clicked.connect(self.apply_parameter)
+        editor.addWidget(self.parameter_apply)
+        editor.addStretch()
+        layout.addLayout(editor)
+        self.parameter_feedback = label("Connect Demo simulator to enable changes.", 11, ORANGE)
+        self.parameter_feedback.setWordWrap(True)
+        layout.addWidget(self.parameter_feedback)
+        main.addWidget(form)
+        main.addWidget(label("PARAMETER CHANGE LOG", 11, MUTED, True))
+        self.parameter_log = QTextEdit()
+        self.parameter_log.setReadOnly(True)
+        self.parameter_log.setPlainText("No simulated parameter changes yet.")
+        main.addWidget(self.parameter_log, 1)
+        self.update_parameter_panel()
+        return page
+
+    def _demo_parameters_enabled(self):
+        return bool(self.worker and self.worker.isRunning() and self.worker.mode == "demo")
+
+    def update_parameter_panel(self):
+        key = self.parameter_select.currentData()
+        if key not in DEFINITIONS:
+            return
+        info = self.parameter_store.read(key)
+        self.parameter_current.setText(f"Current: {info['value']} {info['unit']}")
+        self.parameter_info.setText(
+            info["description"] + f"  Allowed demo range: {info['minimum']}–{info['maximum']} {info['unit']}."
+        )
+        self.parameter_value.setRange(info["minimum"], info["maximum"])
+        self.parameter_value.setValue(info["value"])
+        self.parameter_feedback.setText("Simulation only — not a real ECU adaptation.")
+        self.parameter_preview.setEnabled(self._demo_parameters_enabled())
+        self.parameter_apply.setEnabled(self._demo_parameters_enabled())
+
+    def preview_parameter(self):
+        if not self._demo_parameters_enabled():
+            self.parameter_feedback.setText("Connect Demo simulator. Real vehicle parameter writes are disabled.")
+            return
+        try:
+            result = self.parameter_store.preview(self.parameter_select.currentData(),
+                                                  self.parameter_value.value())
+        except ParameterError as exc:
+            self.parameter_feedback.setText(str(exc))
+            return
+        self.parameter_feedback.setText(
+            f"PREVIEW ONLY: {result['parameter']}: {result['previous']} → {result['proposed']} {result['unit']}."
+        )
+
+    def apply_parameter(self):
+        if not self._demo_parameters_enabled():
+            self.parameter_feedback.setText("Blocked: only the simulated ECU parameter store is editable.")
+            return
+        key = self.parameter_select.currentData()
+        proposed = self.parameter_value.value()
+        try:
+            preview = self.parameter_store.preview(key, proposed)
+        except ParameterError as exc:
+            self.parameter_feedback.setText(str(exc))
+            return
+        decision = QMessageBox.question(
+            self, "Confirm simulated parameter change",
+            f"DEMO ONLY — no ECU will be modified.\n"
+            f"Change {key}: {preview['previous']} → {preview['proposed']} {preview['unit']}?",
+            QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel,
+        )
+        if decision != QMessageBox.Yes:
+            return
+        result = self.parameter_store.apply(key, proposed, confirmed=True)
+        self.parameter_feedback.setText("SIMULATED CHANGE VERIFIED by local readback.")
+        self.parameter_current.setText(f"Current: {result['proposed']} {result['unit']}")
+        line = json.dumps(result, ensure_ascii=False)
+        self.parameter_log.append(line)
+        self.sessions_text.append("\nSIMULATED PARAMETER: " + line)
+        # The demo store is not an ECU; record in a local audit journal.
+        from pathlib import Path
+        audit_path = Path("logs") / "parameter-demo-audit.jsonl"
+        audit_path.parent.mkdir(parents=True, exist_ok=True)
+        with audit_path.open("a", encoding="utf-8") as audit:
+            audit.write(line + "\n")
 
     def sessions_page(self):
         page = QWidget()
@@ -698,11 +819,13 @@ class AutoFX(QMainWindow):
         self.ai_snapshot_status.setText("Waiting for telemetry")
         self.tick = 0
         self.worker.start()
+        self.update_parameter_panel()
 
     def on_connected(self, description):
         self.status.setText("●  DEMO ACTIVE" if self.mode.currentIndex() == 0 else "●  ECU CONNECTED")
         self.status.setStyleSheet("color: " + GREEN + ";")
         self.footer.setText(description)
+        self.update_parameter_panel()
 
     def on_sample(self, sample):
         self.last_sample = dict(sample)
@@ -744,6 +867,7 @@ class AutoFX(QMainWindow):
         self.mode.setEnabled(True)
         self.scan_button.setEnabled(True)
         self.ports.setEnabled(True)
+        self.update_parameter_panel()
 
     def closeEvent(self, event):
         if self.ai_worker is not None and self.ai_worker.isRunning():
@@ -770,7 +894,7 @@ QPushButton#primary:hover { background: #2394ec; }
 QPushButton[nav="true"] { text-align: left; background: transparent; border: 0; padding: 14px; color: #94a6bc; }
 QPushButton[nav="true"]:hover { background: #1b2b3d; }
 QPushButton[selected="true"] { background: #1d344a; color: #63c4ff; border-left: 3px solid #4cb7ff; }
-QComboBox, QLineEdit, QTextEdit, QTableWidget { background: #111b28; color: #e6edf6; border: 1px solid #304156; border-radius: 7px; padding: 8px; }
+QComboBox, QLineEdit, QSpinBox, QTextEdit, QTableWidget { background: #111b28; color: #e6edf6; border: 1px solid #304156; border-radius: 7px; padding: 8px; }
 QComboBox QAbstractItemView { background: #1b293a; color: #e6edf6; selection-background-color: #28577b; }
 QTableWidget { gridline-color: #29384b; alternate-background-color: #172333; }
 QHeaderView::section { background: #1b293a; color: #a9bbcc; padding: 12px; border: 0; }
