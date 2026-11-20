@@ -7,6 +7,7 @@ AutoFX je Python desktop dijagnostički alat za **stvarna vozila** i **ELM327 Bl
 ## Trenutne mogućnosti
 
 - **Overview:** RPM, brzina, temperatura rashladne tečnosti, opterećenje i gas; real-time grafikon.
+- **Vehicle:** stvarni Mode 09 VIN (ako je dostupan), CALID/CVN, OBD protokol i lista prijavljenih podržanih generičkih PID-ova.
 - **Diagnostics:** očitani DTC kodovi i detalji; razgovor sa AI o izabranoj grešci.
 - **Targeted diagnostics:** Engine, EGR, DPF/SCR profili sa generičkim, *stvarno dostupnim* OBD-II PID-ovima. Nepodržani PID prikazuje se kao nedostupan.
 - **Service 04:** globalno brisanje podržanih emisijski povezanih DTC podataka, sa dvostrukom potvrdom, proverom stanja vozila i ponovnim očitavanjem. Ne briše proizvoljno izabranu grešku.
@@ -76,7 +77,8 @@ Bluetooth Low Energy (BLE) ili Wi-Fi adapter možda ne radi sa postojećim serij
 2. Upari uređaj sa računarom i proveri odgovarajući serijski port.
 3. Uključi kontakt prema potrebama izabrane OBD procedure.
 4. Pokreni aplikaciju i klikni **Connect**.
-5. Podaci se pojavljuju samo ako ECU uspešno odgovara. Ako ne podržava PID, nema izmišljene zamenske vrednosti.
+5. Otvori **Vehicle** za stvarnu identifikaciju ECU-a i proveru PID podrške.
+6. Podaci se pojavljuju samo ako ECU uspešno odgovara. Ako ne podržava PID, nema izmišljene zamenske vrednosti.
 
 Stvarno brisanje DTC podataka može resetovati readiness monitore i ukloniti freeze-frame. Pre intervencije sačuvaj očitavanja. Za Service 04 motor mora biti ugašen, vozilo zaustavljeno, a RPM i SPEED moraju biti raspoloživi i 0 prema svežem ECU očitavanju. Neki ECU-ovi ne ispunjavaju ove uslove i tada aplikacija blokira operaciju.
 
@@ -142,3 +144,4 @@ Na Windowsu koristi `.venv\Scripts\python.exe` umesto `python`.
 - [AI Mechanic](docs/AI_MECHANIC.md)
 - [Dijagnostički profili](docs/TARGETED_DIAGNOSTICS.md)
 - [Service Workspace](docs/SERVICE_WORKSPACE.md)
+- [Identifikacija vozila](docs/VEHICLE_IDENTITY.md)
