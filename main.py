@@ -5,13 +5,12 @@ import json
 import time
 from datetime import datetime
 from pathlib import Path
-from obd_ai.adapter import DemoAdapter, Elm327Adapter
+from obd_ai.adapter import Elm327Adapter
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Read-only ELM327 diagnostic logger")
     parser.add_argument("--port", help="Paired Bluetooth serial port, e.g. COM5 or /dev/rfcomm0")
     parser.add_argument("--baudrate", type=int)
-    parser.add_argument("--demo", action="store_true", help="Simulated vehicle")
     parser.add_argument("--list-ports", action="store_true", help="List serial ports")
     parser.add_argument("--interval", type=float, default=2)
     parser.add_argument("--count", type=int, default=0, help="0 = until Ctrl+C")
@@ -25,7 +24,9 @@ def main() -> None:
         return
     if args.interval < 0.5 or args.count < 0:
         parser.error("--interval must be >= 0.5 and --count must be >= 0")
-    adapter = DemoAdapter() if args.demo else Elm327Adapter(args.port, args.baudrate)
+    if not args.port:
+        parser.error("--port is required for live vehicle diagnostics (use --list-ports to find it)")
+    adapter = Elm327Adapter(args.port, args.baudrate)
     output = args.output or Path("logs") / f"session-{datetime.now().strftime('%Y%m%d-%H%M%S')}.jsonl"
     output.parent.mkdir(parents=True, exist_ok=True)
     try:

@@ -26,8 +26,8 @@ def validate_clear_request(*, mode: str, sample: dict | None,
     """
     if not confirmed or text.strip() != CONFIRMATION_TEXT:
         raise OperationDenied("Explicit confirmation CLEAR ALL is required.")
-    if mode not in ("vehicle", "demo"):
-        raise OperationDenied("Vehicle or simulator must be connected.")
+    if mode != "vehicle":
+        raise OperationDenied("A real OBD vehicle connection is required.")
     if not isinstance(sample, dict) or sample.get("mode") != mode:
         raise OperationDenied("Fresh telemetry from the same connected source is required.")
     sensors = sample.get("sensors", {})
