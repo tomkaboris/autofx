@@ -17,12 +17,13 @@ from PySide6.QtCore import QThread, Qt, Signal
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel,
-    QMainWindow, QMessageBox, QPushButton, QStackedWidget, QTableWidget,
+    QLineEdit, QMainWindow, QMessageBox, QPushButton, QStackedWidget, QTableWidget,
     QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
 )
 from serial.tools import list_ports
 
 from obd_ai.adapter import DemoAdapter, Elm327Adapter
+from obd_ai.ai_mechanic import answer, diagnostic_context
 
 BG = "#0b111b"
 PANEL = "#141e2c"
@@ -83,6 +84,21 @@ class Acquisition(QThread):
                 pass
 
 
+class AnalysisWorker(QThread):
+    completed = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, question: str, snapshot: dict, provider: str):
+        super().__init__()
+        self.question, self.snapshot, self.provider = question, snapshot, provider
+
+    def run(self):
+        try:
+            self.completed.emit(answer(self.question, self.snapshot, self.provider))
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 def label(text, size=12, color=FG, bold=False):
     item = QLabel(text)
     font = QFont("Segoe UI", size)
@@ -124,6 +140,9 @@ class AutoFX(QMainWindow):
         self.resize(1380, 850)
         self.setMinimumSize(1040, 680)
         self.worker = None
+        self.ai_worker = None
+        self.last_sample = None
+        self.current_codes = []
         self.history = deque(maxlen=90)
         self.tick = 0
         self.session_path = "No session saved yet"
@@ -157,7 +176,7 @@ class AutoFX(QMainWindow):
             nav.addWidget(b)
         nav.addStretch()
         nav.addWidget(label("ENGINEERING WORKSTATION", 9, MUTED))
-        nav.addWidget(label("v0.2 · READ ONLY", 10, GREEN, True))
+        nav.addWidget(label("v0.3 · READ ONLY", 10, GREEN, True))
         row.addWidget(sidebar)
 
         workspace = QWidget()
@@ -281,15 +300,84 @@ class AutoFX(QMainWindow):
         page = QWidget()
         main = QVBoxLayout(page)
         main.setContentsMargins(0, 0, 0, 0)
-        main.addWidget(label("AI diagnostic assistant", 17, FG, True))
-        main.addWidget(label("Planned integration · not connected to any AI provider", 11, ORANGE))
-        box = panel()
-        column = QVBoxLayout(box)
-        column.addWidget(label("AI-ready telemetry", 16, FG, True))
-        column.addWidget(label("The current application records structured sensor readings and DTCs.\nFuture AI analysis will use read-only, allowlisted tools. No direct ECU writes.", 12, MUTED))
-        main.addWidget(box)
-        main.addStretch()
+        main.setSpacing(15)
+        main.addWidget(label("AI Mechanic · diagnostic assistant", 17, FG, True))
+        main.addWidget(label("Read-only analysis of current OBD values and stored trouble codes", 11, MUTED))
+        settings = panel()
+        controls = QHBoxLayout(settings)
+        controls.addWidget(label("ANALYSIS MODE", 10, MUTED, True))
+        self.ai_provider = QComboBox()
+        self.ai_provider.addItems(["Local analysis (offline)", "OpenAI cloud (explicit opt-in)"])
+        controls.addWidget(self.ai_provider)
+        controls.addStretch()
+        self.ai_snapshot_status = label("No snapshot available", 10, ORANGE)
+        controls.addWidget(self.ai_snapshot_status)
+        main.addWidget(settings)
+        self.ai_chat = QTextEdit()
+        self.ai_chat.setReadOnly(True)
+        self.ai_chat.setPlainText(
+            "AutoFX AI Mechanic\n\n"
+            "Poveži ECU ili Demo simulator, pa postavi pitanje ili klikni Analyze snapshot.\n"
+            "Local analysis koristi ugrađena pravila bez API-ja. OpenAI režim zahteva OPENAI_API_KEY "
+            "i šalje trenutna očitavanja i pitanje cloud servisu.\n\n"
+            "Ovaj asistent nikada ne šalje komande ECU-u."
+        )
+        main.addWidget(self.ai_chat, 1)
+        question_row = QHBoxLayout()
+        self.ai_question = QLineEdit()
+        self.ai_question.setPlaceholderText("Npr. Šta znače ove greške i koje provere preporučuješ?")
+        self.ai_question.returnPressed.connect(self.ask_ai)
+        question_row.addWidget(self.ai_question, 1)
+        self.ai_send = QPushButton("Ask AI")
+        self.ai_send.setObjectName("primary")
+        self.ai_send.clicked.connect(self.ask_ai)
+        question_row.addWidget(self.ai_send)
+        main.addLayout(question_row)
+        actions = QHBoxLayout()
+        self.ai_analyze = QPushButton("Analyze snapshot")
+        self.ai_analyze.clicked.connect(self.analyze_snapshot)
+        actions.addWidget(self.ai_analyze)
+        actions.addStretch()
+        actions.addWidget(label("Cloud sends a limited snapshot only on request", 10, MUTED))
+        main.addLayout(actions)
         return page
+
+    def analyze_snapshot(self):
+        self.start_analysis("Analiziraj trenutno stanje motora i DTC kodove; predloži redosled bezbednih provera.")
+
+    def ask_ai(self):
+        question = self.ai_question.text().strip()
+        if question:
+            self.start_analysis(question)
+            self.ai_question.clear()
+
+    def start_analysis(self, question):
+        if self.ai_worker is not None and self.ai_worker.isRunning():
+            return
+        if self.last_sample is None:
+            self.ai_chat.append("\n[AutoFX] Nema aktivnih očitavanja. Poveži ECU ili demo simulator.")
+            return
+        provider = "openai" if self.ai_provider.currentIndex() == 1 else "offline"
+        snapshot = diagnostic_context(self.last_sample, self.current_codes)
+        self.ai_chat.append("\nTEHNIČAR: " + question)
+        self.ai_chat.append("\nAutoFX: Analiziram trenutni snimak …")
+        self.ai_send.setEnabled(False)
+        self.ai_analyze.setEnabled(False)
+        self.ai_worker = AnalysisWorker(question, snapshot, provider)
+        self.ai_worker.completed.connect(self.on_ai_answer)
+        self.ai_worker.failed.connect(self.on_ai_failure)
+        self.ai_worker.finished.connect(self.on_ai_finished)
+        self.ai_worker.start()
+
+    def on_ai_answer(self, text):
+        self.ai_chat.append("\nAI MECHANIC:\n" + text + "\n")
+
+    def on_ai_failure(self, message):
+        self.ai_chat.append("\nGREŠKA: " + message + "\n")
+
+    def on_ai_finished(self):
+        self.ai_send.setEnabled(True)
+        self.ai_analyze.setEnabled(True)
 
     def show_page(self, index):
         self.pages.setCurrentIndex(index)
@@ -331,6 +419,10 @@ class AutoFX(QMainWindow):
         self.status.setText("●  CONNECTING")
         self.footer.setText("Opening OBD connection …")
         self.history.clear()
+        self.last_sample = None
+        self.current_codes = []
+        self.dtc_table.setRowCount(0)
+        self.ai_snapshot_status.setText("Waiting for telemetry")
         self.tick = 0
         self.worker.start()
 
@@ -340,6 +432,8 @@ class AutoFX(QMainWindow):
         self.footer.setText(description)
 
     def on_sample(self, sample):
+        self.last_sample = dict(sample)
+        self.ai_snapshot_status.setText("Snapshot ready · " + str(sample.get("mode", "unknown")).upper())
         values = sample.get("sensors", {})
         for key, card in self.cards.items():
             card.update_value(values.get(key))
@@ -349,6 +443,7 @@ class AutoFX(QMainWindow):
         self.curve.setData([x for x, _ in self.history], [y for _, y in self.history])
 
     def on_faults(self, codes):
+        self.current_codes = list(codes)
         self.dtc_table.setRowCount(len(codes))
         for row, item in enumerate(codes):
             self.dtc_table.setItem(row, 0, QTableWidgetItem(str(item.get("code", ""))))
@@ -372,6 +467,10 @@ class AutoFX(QMainWindow):
         self.ports.setEnabled(True)
 
     def closeEvent(self, event):
+        if self.ai_worker is not None and self.ai_worker.isRunning():
+            event.ignore()
+            self.footer.setText("AI request still running. Close after the answer arrives.")
+            return
         if self.worker and self.worker.isRunning():
             self.worker.stop()
             if not self.worker.wait(5000):
@@ -392,7 +491,7 @@ QPushButton#primary:hover { background: #2394ec; }
 QPushButton[nav="true"] { text-align: left; background: transparent; border: 0; padding: 14px; color: #94a6bc; }
 QPushButton[nav="true"]:hover { background: #1b2b3d; }
 QPushButton[selected="true"] { background: #1d344a; color: #63c4ff; border-left: 3px solid #4cb7ff; }
-QComboBox, QTextEdit, QTableWidget { background: #111b28; color: #e6edf6; border: 1px solid #304156; border-radius: 7px; padding: 8px; }
+QComboBox, QLineEdit, QTextEdit, QTableWidget { background: #111b28; color: #e6edf6; border: 1px solid #304156; border-radius: 7px; padding: 8px; }
 QComboBox QAbstractItemView { background: #1b293a; color: #e6edf6; selection-background-color: #28577b; }
 QTableWidget { gridline-color: #29384b; alternate-background-color: #172333; }
 QHeaderView::section { background: #1b293a; color: #a9bbcc; padding: 12px; border: 0; }
