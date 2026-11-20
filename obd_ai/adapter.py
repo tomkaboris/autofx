@@ -4,6 +4,8 @@ from datetime import datetime, timezone
 from typing import Any
 from obd_ai.profiles import get_profile
 from obd_ai.service_operations import ACTION_NAME
+from obd_ai.vehicle_identity import (IDENTITY_COMMANDS, SUPPORTED_PROFILE_COMMANDS,
+                                     build_identity)
 
 SENSORS = ("RPM", "SPEED", "COOLANT_TEMP", "ENGINE_LOAD", "THROTTLE_POS")
 
@@ -29,6 +31,39 @@ class Elm327Adapter:
             self.close()
             raise ConnectionError(f"ECU connection failed ({status}); check ignition, Bluetooth and port.")
         return f"Connected: {self.connection.port_name()} | {self.connection.protocol_name()}"
+
+    def identify_vehicle(self) -> dict[str, Any]:
+        """Read the connected ECU's generic identification and advertised PIDs.
+
+        Called only on the acquisition thread to serialize all serial access.
+        Mode 09 is best effort: some adapters or vehicles return no values.
+        """
+        if self.connection is None or self.obd is None or not self.connection.is_connected():
+            raise ConnectionError("ECU is not connected")
+        supported: dict[str, bool] = {}
+        values: dict[str, str | None] = {}
+        for name in (*IDENTITY_COMMANDS, *SUPPORTED_PROFILE_COMMANDS):
+            command = getattr(self.obd.commands, name, None)
+            try:
+                supported[name] = bool(
+                    command is not None and self.connection.supports(command)
+                )
+            except (ValueError, AttributeError, OSError):
+                supported[name] = False
+        for name in IDENTITY_COMMANDS:
+            if not supported.get(name):
+                values[name] = None
+                continue
+            try:
+                response = self.connection.query(getattr(self.obd.commands, name))
+                values[name] = None if response.is_null() else str(response.value)
+            except (AttributeError, ValueError, TypeError, OSError):
+                values[name] = None
+        return build_identity(
+            protocol=str(self.connection.protocol_name() or ""),
+            port=str(self.connection.port_name() or ""),
+            values=values, supported=supported,
+        )
 
     def read(self) -> dict[str, Any]:
         assert self.connection is not None and self.obd is not None
