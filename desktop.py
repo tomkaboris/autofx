@@ -466,7 +466,7 @@ class AutoFX(QMainWindow):
         main.addWidget(label("Each session writes telemetry to a local JSONL log.", 11, MUTED))
         self.sessions_text = QTextEdit()
         self.sessions_text.setReadOnly(True)
-        self.sessions_text.setPlainText("Connect in Demo or ELM327 mode to record a session.\n\nLogs are saved under ./logs/ and are excluded from Git.")
+        self.sessions_text.setPlainText("Connect the real ELM327 serial adapter to record a session.\n\nLogs are saved under ./logs/ and are excluded from Git.")
         main.addWidget(self.sessions_text, 1)
         return page
 
