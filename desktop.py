@@ -18,16 +18,15 @@ from PySide6.QtCore import QThread, Qt, Signal
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel,
-    QInputDialog, QLineEdit, QMainWindow, QMessageBox, QPushButton, QSpinBox, QStackedWidget, QTableWidget,
+    QInputDialog, QLineEdit, QMainWindow, QMessageBox, QPushButton, QStackedWidget, QTableWidget,
     QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
 )
 from serial.tools import list_ports
 
-from obd_ai.adapter import DemoAdapter, Elm327Adapter
+from obd_ai.adapter import Elm327Adapter
 from obd_ai.ai_mechanic import answer, diagnostic_context
 from obd_ai.profiles import PROFILES, profile_for_question
 from obd_ai.service_operations import CONFIRMATION_TEXT, OperationDenied, operation_description, validate_clear_request
-from obd_ai.parameters import DEFINITIONS, DemoParameterStore, ParameterError
 
 BG = "#0b111b"
 PANEL = "#141e2c"
@@ -51,13 +50,12 @@ class Acquisition(QThread):
     failed = Signal(str)
     finished_session = Signal(str)
 
-    def __init__(self, mode: str, port: str, interval: float = 1.5):
+    def __init__(self, port: str, interval: float = 1.5):
         super().__init__()
-        self.mode, self.port, self.interval = mode, port, interval
+        self.mode, self.port, self.interval = "vehicle", port, interval
         self._stop = threading.Event()
         self._profile_requests = Queue(maxsize=1)
         self._service_requests = Queue(maxsize=1)
-        self._demo_engine_off = threading.Event()
 
     def request_profile(self, key: str) -> bool:
         if self._stop.is_set() or not self.isRunning():
@@ -67,14 +65,6 @@ class Acquisition(QThread):
         except Exception:
             return False
         return True
-
-    def set_demo_engine_off(self, enabled: bool) -> None:
-        if self.mode != "demo":
-            return
-        if enabled:
-            self._demo_engine_off.set()
-        else:
-            self._demo_engine_off.clear()
 
     def request_service(self, authorization: dict) -> bool:
         if self._stop.is_set() or not self.isRunning():
@@ -89,7 +79,7 @@ class Acquisition(QThread):
         self._stop.set()
 
     def run(self):
-        adapter = DemoAdapter() if self.mode == "demo" else Elm327Adapter(self.port)
+        adapter = Elm327Adapter(self.port)
         output = Path("logs") / ("desktop-" + datetime.now().strftime("%Y%m%d-%H%M%S") + ".jsonl")
         try:
             self.connected.emit(adapter.connect())
@@ -103,8 +93,6 @@ class Acquisition(QThread):
                     stream.write(json.dumps({"type": "dtc_error", "message": str(exc)}) + "\n")
                     self.failed.emit("DTC read failed: " + str(exc))
                 while not self._stop.is_set():
-                    if self.mode == "demo":
-                        adapter.engine_running = not self._demo_engine_off.is_set()
                     try:
                         service_request = self._service_requests.get_nowait()
                     except Empty:
@@ -222,7 +210,6 @@ class AutoFX(QMainWindow):
         self.last_sample = None
         self.current_codes = []
         self.last_scan = None
-        self.parameter_store = DemoParameterStore()
         self.last_sample_received = 0.0
         self.history = deque(maxlen=90)
         self.tick = 0
@@ -248,7 +235,7 @@ class AutoFX(QMainWindow):
         nav.addWidget(label("AUTOMOTIVE DIAGNOSTICS", 9, MUTED, True))
         nav.addSpacing(30)
         self.nav_buttons = []
-        for name in ("Overview", "Diagnostics", "Parameters", "Sessions", "AI Assistant"):
+        for name in ("Overview", "Diagnostics", "Sessions", "AI Assistant"):
             b = QPushButton(name)
             b.setProperty("nav", True)
             b.setCursor(Qt.PointingHandCursor)
@@ -257,7 +244,7 @@ class AutoFX(QMainWindow):
             nav.addWidget(b)
         nav.addStretch()
         nav.addWidget(label("ENGINEERING WORKSTATION", 9, MUTED))
-        nav.addWidget(label("v0.5 · SERVICE WORKSPACE", 10, GREEN, True))
+        nav.addWidget(label("REAL VEHICLE · SERVICE WORKSPACE", 10, GREEN, True))
         row.addWidget(sidebar)
 
         workspace = QWidget()
@@ -277,10 +264,7 @@ class AutoFX(QMainWindow):
         bar = panel()
         bar_layout = QHBoxLayout(bar)
         bar_layout.setContentsMargins(16, 12, 16, 12)
-        bar_layout.addWidget(label("SOURCE", 10, MUTED, True))
-        self.mode = QComboBox()
-        self.mode.addItems(["Demo simulator", "ELM327 serial"])
-        bar_layout.addWidget(self.mode)
+        bar_layout.addWidget(label("ELM327 SERIAL · REAL VEHICLE ONLY", 10, GREEN, True))
         bar_layout.addSpacing(12)
         bar_layout.addWidget(label("PORT", 10, MUTED, True))
         self.ports = QComboBox()
@@ -301,12 +285,11 @@ class AutoFX(QMainWindow):
         self.pages = QStackedWidget()
         self.pages.addWidget(self.overview_page())
         self.pages.addWidget(self.diagnostics_page())
-        self.pages.addWidget(self.parameters_page())
         self.pages.addWidget(self.sessions_page())
         self.pages.addWidget(self.ai_page())
         layout.addWidget(self.pages, 1)
 
-        self.footer = label("Ready · Demo mode available without a vehicle", 10, MUTED)
+        self.footer = label("Connect a real ELM327 adapter to start a diagnostic session", 10, MUTED)
         layout.addWidget(self.footer)
         row.addWidget(workspace, 1)
         self.show_page(0)
@@ -398,10 +381,6 @@ class AutoFX(QMainWindow):
         self.dtc_clear_button = QPushButton("Clear emissions DTCs (Mode 04)")
         self.dtc_clear_button.clicked.connect(self.confirm_clear_dtcs)
         service_actions.addWidget(self.dtc_clear_button)
-        self.demo_engine_off_button = QPushButton("Demo: simulate engine OFF")
-        self.demo_engine_off_button.setCheckable(True)
-        self.demo_engine_off_button.toggled.connect(self.toggle_demo_engine)
-        service_actions.addWidget(self.demo_engine_off_button)
         service_actions.addStretch()
         service_layout.addLayout(service_actions)
         self.service_note = label("Operator confirmation + fresh RPM=0 / SPEED=0 required.", 10, ORANGE)
@@ -432,28 +411,12 @@ class AutoFX(QMainWindow):
         code = self.current_codes[row]
         question = ("Objasni DTC " + str(code.get("code", "")) +
                     " i njegove moguće uzroke. Predloži bezbedne servisne provere pre brisanja.")
-        self.show_page(4)
+        self.show_page(3)
         self.start_analysis(question)
-
-    def toggle_demo_engine(self, enabled):
-        if not self.worker or not self.worker.isRunning() or self.worker.mode != "demo":
-            self.demo_engine_off_button.blockSignals(True)
-            self.demo_engine_off_button.setChecked(False)
-            self.demo_engine_off_button.blockSignals(False)
-            self.service_note.setText("Engine-off simulation is only available in connected Demo mode.")
-            return
-        self.worker.set_demo_engine_off(enabled)
-        self.demo_engine_off_button.setText(
-            "Demo: engine OFF (ignition ON)" if enabled else "Demo: simulate engine OFF"
-        )
-        self.service_note.setText(
-            "Demo ignition ON / engine OFF. Wait for a fresh RPM=0 sample."
-            if enabled else "Demo engine running."
-        )
 
     def confirm_clear_dtcs(self):
         if self.worker is None or not self.worker.isRunning():
-            QMessageBox.warning(self, "No ECU", "Connect a vehicle or Demo simulator first.")
+            QMessageBox.warning(self, "No ECU", "Connect a real ELM327 adapter first.")
             return
         if self.last_sample is None:
             QMessageBox.warning(self, "No live reading", "Wait for current RPM and SPEED readings.")
@@ -494,124 +457,6 @@ class AutoFX(QMainWindow):
             QMessageBox.warning(self, "Service result", message)
         else:
             QMessageBox.information(self, "Service result", message)
-
-    def parameters_page(self):
-        page = QWidget()
-        main = QVBoxLayout(page)
-        main.setContentsMargins(0, 0, 0, 0)
-        main.setSpacing(15)
-        main.addWidget(label("ECU Parameter Management", 19, FG, True))
-        description = label(
-            "LAB SIMULATION ONLY: parameter changes in this screen never reach a physical ECU.", 11, ORANGE
-        )
-        description.setWordWrap(True)
-        main.addWidget(description)
-
-        form = panel()
-        layout = QVBoxLayout(form)
-        layout.addWidget(label("SIMULATED ECU PARAMETERS", 10, MUTED, True))
-        controls = QHBoxLayout()
-        controls.addWidget(label("Parameter", 11, MUTED))
-        self.parameter_select = QComboBox()
-        for key, item in DEFINITIONS.items():
-            self.parameter_select.addItem(item.name, key)
-        self.parameter_select.currentIndexChanged.connect(self.update_parameter_panel)
-        controls.addWidget(self.parameter_select, 1)
-        layout.addLayout(controls)
-        self.parameter_info = label("", 11, MUTED)
-        self.parameter_info.setWordWrap(True)
-        layout.addWidget(self.parameter_info)
-        self.parameter_current = label("Current: —", 22, FG, True)
-        layout.addWidget(self.parameter_current)
-        editor = QHBoxLayout()
-        editor.addWidget(label("Proposed value", 11, MUTED))
-        self.parameter_value = QSpinBox()
-        self.parameter_value.setMinimumWidth(130)
-        editor.addWidget(self.parameter_value)
-        self.parameter_preview = QPushButton("Preview")
-        self.parameter_preview.clicked.connect(self.preview_parameter)
-        editor.addWidget(self.parameter_preview)
-        self.parameter_apply = QPushButton("Apply in simulator")
-        self.parameter_apply.setObjectName("primary")
-        self.parameter_apply.clicked.connect(self.apply_parameter)
-        editor.addWidget(self.parameter_apply)
-        editor.addStretch()
-        layout.addLayout(editor)
-        self.parameter_feedback = label("Connect Demo simulator to enable changes.", 11, ORANGE)
-        self.parameter_feedback.setWordWrap(True)
-        layout.addWidget(self.parameter_feedback)
-        main.addWidget(form)
-        main.addWidget(label("PARAMETER CHANGE LOG", 11, MUTED, True))
-        self.parameter_log = QTextEdit()
-        self.parameter_log.setReadOnly(True)
-        self.parameter_log.setPlainText("No simulated parameter changes yet.")
-        main.addWidget(self.parameter_log, 1)
-        self.update_parameter_panel()
-        return page
-
-    def _demo_parameters_enabled(self):
-        return bool(self.worker and self.worker.isRunning() and self.worker.mode == "demo")
-
-    def update_parameter_panel(self):
-        key = self.parameter_select.currentData()
-        if key not in DEFINITIONS:
-            return
-        info = self.parameter_store.read(key)
-        self.parameter_current.setText(f"Current: {info['value']} {info['unit']}")
-        self.parameter_info.setText(
-            info["description"] + f"  Allowed demo range: {info['minimum']}–{info['maximum']} {info['unit']}."
-        )
-        self.parameter_value.setRange(info["minimum"], info["maximum"])
-        self.parameter_value.setValue(info["value"])
-        self.parameter_feedback.setText("Simulation only — not a real ECU adaptation.")
-        self.parameter_preview.setEnabled(self._demo_parameters_enabled())
-        self.parameter_apply.setEnabled(self._demo_parameters_enabled())
-
-    def preview_parameter(self):
-        if not self._demo_parameters_enabled():
-            self.parameter_feedback.setText("Connect Demo simulator. Real vehicle parameter writes are disabled.")
-            return
-        try:
-            result = self.parameter_store.preview(self.parameter_select.currentData(),
-                                                  self.parameter_value.value())
-        except ParameterError as exc:
-            self.parameter_feedback.setText(str(exc))
-            return
-        self.parameter_feedback.setText(
-            f"PREVIEW ONLY: {result['parameter']}: {result['previous']} → {result['proposed']} {result['unit']}."
-        )
-
-    def apply_parameter(self):
-        if not self._demo_parameters_enabled():
-            self.parameter_feedback.setText("Blocked: only the simulated ECU parameter store is editable.")
-            return
-        key = self.parameter_select.currentData()
-        proposed = self.parameter_value.value()
-        try:
-            preview = self.parameter_store.preview(key, proposed)
-        except ParameterError as exc:
-            self.parameter_feedback.setText(str(exc))
-            return
-        decision = QMessageBox.question(
-            self, "Confirm simulated parameter change",
-            f"DEMO ONLY — no ECU will be modified.\n"
-            f"Change {key}: {preview['previous']} → {preview['proposed']} {preview['unit']}?",
-            QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel,
-        )
-        if decision != QMessageBox.Yes:
-            return
-        result = self.parameter_store.apply(key, proposed, confirmed=True)
-        self.parameter_feedback.setText("SIMULATED CHANGE VERIFIED by local readback.")
-        self.parameter_current.setText(f"Current: {result['proposed']} {result['unit']}")
-        line = json.dumps(result, ensure_ascii=False)
-        self.parameter_log.append(line)
-        self.sessions_text.append("\nSIMULATED PARAMETER: " + line)
-        # The demo store is not an ECU; record in a local audit journal.
-        from pathlib import Path
-        audit_path = Path("logs") / "parameter-demo-audit.jsonl"
-        audit_path.parent.mkdir(parents=True, exist_ok=True)
-        with audit_path.open("a", encoding="utf-8") as audit:
-            audit.write(line + "\n")
 
     def sessions_page(self):
         page = QWidget()
@@ -671,7 +516,7 @@ class AutoFX(QMainWindow):
         self.ai_chat.setReadOnly(True)
         self.ai_chat.setPlainText(
             "AutoFX AI Mechanic\n\n"
-            "Poveži ECU ili Demo simulator, pa postavi pitanje ili klikni Analyze snapshot.\n"
+            "Poveži stvarni ECU i postavi pitanje ili klikni Analyze snapshot.\n"
             "Local analysis koristi ugrađena pravila bez API-ja. OpenAI režim zahteva OPENAI_API_KEY "
             "i šalje trenutna očitavanja i pitanje cloud servisu.\n\n"
             "Ovaj asistent nikada ne šalje komande ECU-u."
@@ -699,7 +544,7 @@ class AutoFX(QMainWindow):
     def request_diagnostic_scan(self):
         key = self.scan_profile.currentData()
         if self.worker is None or not self.worker.isRunning():
-            self.scan_note.setText("First connect a vehicle or the demo simulator.")
+            self.scan_note.setText("First connect a real vehicle.")
             return
         if self.worker.request_profile(key):
             self.scan_button.setEnabled(False)
@@ -738,7 +583,7 @@ class AutoFX(QMainWindow):
         if self.ai_worker is not None and self.ai_worker.isRunning():
             return
         if self.last_sample is None:
-            self.ai_chat.append("\n[AutoFX] Nema aktivnih očitavanja. Poveži ECU ili demo simulator.")
+            self.ai_chat.append("\n[AutoFX] Nema aktivnih očitavanja. Poveži stvarni ECU.")
             return
         provider = "openai" if self.ai_provider.currentIndex() == 1 else "offline"
         snapshot = diagnostic_context(self.last_sample, self.current_codes, self.last_scan)
@@ -784,12 +629,11 @@ class AutoFX(QMainWindow):
             self.worker.stop()
             self.status.setText("●  DISCONNECTING")
             return
-        mode = "demo" if self.mode.currentIndex() == 0 else "vehicle"
         port = self.ports.currentText().strip()
-        if mode == "vehicle" and not port:
+        if not port:
             QMessageBox.warning(self, "Port required", "Select the ELM327 serial port.")
             return
-        self.worker = Acquisition(mode, port)
+        self.worker = Acquisition(port)
         self.worker.connected.connect(self.on_connected)
         self.worker.sample.connect(self.on_sample)
         self.worker.faults.connect(self.on_faults)
@@ -799,7 +643,6 @@ class AutoFX(QMainWindow):
         self.worker.finished_session.connect(self.on_saved)
         self.worker.finished.connect(self.on_stopped)
         self.connect_button.setText("Disconnect")
-        self.mode.setEnabled(False)
         self.ports.setEnabled(False)
         self.status.setText("●  CONNECTING")
         self.footer.setText("Opening OBD connection …")
@@ -808,24 +651,17 @@ class AutoFX(QMainWindow):
         self.current_codes = []
         self.last_scan = None
         self.dtc_clear_button.setEnabled(True)
-        self.demo_engine_off_button.blockSignals(True)
-        self.demo_engine_off_button.setChecked(False)
-        self.demo_engine_off_button.blockSignals(False)
-        self.demo_engine_off_button.setText("Demo: simulate engine OFF")
-        self.demo_engine_off_button.setVisible(mode == "demo")
         self.scan_results.setRowCount(0)
         self.scan_button.setEnabled(True)
         self.dtc_table.setRowCount(0)
         self.ai_snapshot_status.setText("Waiting for telemetry")
         self.tick = 0
         self.worker.start()
-        self.update_parameter_panel()
 
     def on_connected(self, description):
-        self.status.setText("●  DEMO ACTIVE" if self.mode.currentIndex() == 0 else "●  ECU CONNECTED")
+        self.status.setText("●  ECU CONNECTED")
         self.status.setStyleSheet("color: " + GREEN + ";")
         self.footer.setText(description)
-        self.update_parameter_panel()
 
     def on_sample(self, sample):
         self.last_sample = dict(sample)
@@ -859,15 +695,12 @@ class AutoFX(QMainWindow):
 
     def on_stopped(self):
         self.dtc_clear_button.setEnabled(True)
-        self.demo_engine_off_button.setVisible(False)
         self.status.setText("●  DISCONNECTED")
         self.status.setStyleSheet("color: " + MUTED + ";")
         self.connect_button.setText("Connect")
         self.connect_button.setEnabled(True)
-        self.mode.setEnabled(True)
         self.scan_button.setEnabled(True)
         self.ports.setEnabled(True)
-        self.update_parameter_panel()
 
     def closeEvent(self, event):
         if self.ai_worker is not None and self.ai_worker.isRunning():
@@ -894,7 +727,7 @@ QPushButton#primary:hover { background: #2394ec; }
 QPushButton[nav="true"] { text-align: left; background: transparent; border: 0; padding: 14px; color: #94a6bc; }
 QPushButton[nav="true"]:hover { background: #1b2b3d; }
 QPushButton[selected="true"] { background: #1d344a; color: #63c4ff; border-left: 3px solid #4cb7ff; }
-QComboBox, QLineEdit, QSpinBox, QTextEdit, QTableWidget { background: #111b28; color: #e6edf6; border: 1px solid #304156; border-radius: 7px; padding: 8px; }
+QComboBox, QLineEdit, QTextEdit, QTableWidget { background: #111b28; color: #e6edf6; border: 1px solid #304156; border-radius: 7px; padding: 8px; }
 QComboBox QAbstractItemView { background: #1b293a; color: #e6edf6; selection-background-color: #28577b; }
 QTableWidget { gridline-color: #29384b; alternate-background-color: #172333; }
 QHeaderView::section { background: #1b293a; color: #a9bbcc; padding: 12px; border: 0; }
