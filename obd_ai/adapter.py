@@ -1,54 +1,14 @@
 """Read-only OBD-II adapter and demo simulator."""
 from __future__ import annotations
-import random
 from datetime import datetime, timezone
 from typing import Any
-from obd_ai.profiles import demo_scan, get_profile
+from obd_ai.profiles import get_profile
 from obd_ai.service_operations import ACTION_NAME
 
 SENSORS = ("RPM", "SPEED", "COOLANT_TEMP", "ENGINE_LOAD", "THROTTLE_POS")
 
 def timestamp() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-class DemoAdapter:
-    def __init__(self) -> None:
-        self.step = 0
-        self.engine_running = True
-        self.demo_codes = [{"code": "P0300", "description": "Simulated misfire example, not a diagnosis"}]
-
-    def connect(self) -> str:
-        return "DEMO - simulated vehicle (not a real ECU)"
-
-    def read(self) -> dict[str, Any]:
-        self.step += 1
-        return {
-            "timestamp": timestamp(), "mode": "demo",
-            "sensors": {
-                "RPM": round(760 + random.uniform(-35, 35), 1) if self.engine_running else 0,
-                "SPEED": 0,
-                "COOLANT_TEMP": 85 + random.randint(-2, 2),
-                "ENGINE_LOAD": round(19 + random.uniform(-3, 3), 1),
-                "THROTTLE_POS": round(12 + random.uniform(-1, 1), 1),
-            },
-            "units": {"RPM": "rpm", "SPEED": "km/h", "COOLANT_TEMP": "degC", "ENGINE_LOAD": "%", "THROTTLE_POS": "%"},
-        }
-
-    def dtcs(self) -> list[dict[str, str]]:
-        return list(self.demo_codes)
-
-    def clear_emissions_dtcs(self) -> dict[str, Any]:
-        """Simulator only; always labeled as simulated."""
-        before = list(self.demo_codes)
-        self.demo_codes.clear()
-        return {"operation": ACTION_NAME, "mode": "demo", "result": "simulated",
-                "before": before, "after": [], "response_confirmed": True}
-
-    def read_profile(self, key: str) -> dict[str, Any]:
-        return demo_scan(key)
-
-    def close(self) -> None:
-        pass
 
 class Elm327Adapter:
     def __init__(self, port: str | None = None, baudrate: int | None = None) -> None:
