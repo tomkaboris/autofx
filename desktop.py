@@ -56,6 +56,7 @@ class Acquisition(QThread):
         self._stop = threading.Event()
         self._profile_requests = Queue(maxsize=1)
         self._service_requests = Queue(maxsize=1)
+        self._demo_engine_off = threading.Event()
 
     def request_profile(self, key: str) -> bool:
         if self._stop.is_set() or not self.isRunning():
@@ -65,6 +66,14 @@ class Acquisition(QThread):
         except Exception:
             return False
         return True
+
+    def set_demo_engine_off(self, enabled: bool) -> None:
+        if self.mode != "demo":
+            return
+        if enabled:
+            self._demo_engine_off.set()
+        else:
+            self._demo_engine_off.clear()
 
     def request_service(self, authorization: dict) -> bool:
         if self._stop.is_set() or not self.isRunning():
@@ -93,6 +102,8 @@ class Acquisition(QThread):
                     stream.write(json.dumps({"type": "dtc_error", "message": str(exc)}) + "\n")
                     self.failed.emit("DTC read failed: " + str(exc))
                 while not self._stop.is_set():
+                    if self.mode == "demo":
+                        adapter.engine_running = not self._demo_engine_off.is_set()
                     try:
                         service_request = self._service_requests.get_nowait()
                     except Empty:
@@ -384,6 +395,10 @@ class AutoFX(QMainWindow):
         self.dtc_clear_button = QPushButton("Clear emissions DTCs (Mode 04)")
         self.dtc_clear_button.clicked.connect(self.confirm_clear_dtcs)
         service_actions.addWidget(self.dtc_clear_button)
+        self.demo_engine_off_button = QPushButton("Demo: simulate engine OFF")
+        self.demo_engine_off_button.setCheckable(True)
+        self.demo_engine_off_button.toggled.connect(self.toggle_demo_engine)
+        service_actions.addWidget(self.demo_engine_off_button)
         service_actions.addStretch()
         service_layout.addLayout(service_actions)
         self.service_note = label("Operator confirmation + fresh RPM=0 / SPEED=0 required.", 10, ORANGE)
@@ -416,6 +431,22 @@ class AutoFX(QMainWindow):
                     " i njegove moguće uzroke. Predloži bezbedne servisne provere pre brisanja.")
         self.show_page(3)
         self.start_analysis(question)
+
+    def toggle_demo_engine(self, enabled):
+        if not self.worker or not self.worker.isRunning() or self.worker.mode != "demo":
+            self.demo_engine_off_button.blockSignals(True)
+            self.demo_engine_off_button.setChecked(False)
+            self.demo_engine_off_button.blockSignals(False)
+            self.service_note.setText("Engine-off simulation is only available in connected Demo mode.")
+            return
+        self.worker.set_demo_engine_off(enabled)
+        self.demo_engine_off_button.setText(
+            "Demo: engine OFF (ignition ON)" if enabled else "Demo: simulate engine OFF"
+        )
+        self.service_note.setText(
+            "Demo ignition ON / engine OFF. Wait for a fresh RPM=0 sample."
+            if enabled else "Demo engine running."
+        )
 
     def confirm_clear_dtcs(self):
         if self.worker is None or not self.worker.isRunning():
@@ -656,6 +687,11 @@ class AutoFX(QMainWindow):
         self.current_codes = []
         self.last_scan = None
         self.dtc_clear_button.setEnabled(True)
+        self.demo_engine_off_button.blockSignals(True)
+        self.demo_engine_off_button.setChecked(False)
+        self.demo_engine_off_button.blockSignals(False)
+        self.demo_engine_off_button.setText("Demo: simulate engine OFF")
+        self.demo_engine_off_button.setVisible(mode == "demo")
         self.scan_results.setRowCount(0)
         self.scan_button.setEnabled(True)
         self.dtc_table.setRowCount(0)
@@ -700,6 +736,7 @@ class AutoFX(QMainWindow):
 
     def on_stopped(self):
         self.dtc_clear_button.setEnabled(True)
+        self.demo_engine_off_button.setVisible(False)
         self.status.setText("●  DISCONNECTED")
         self.status.setStyleSheet("color: " + MUTED + ";")
         self.connect_button.setText("Connect")
