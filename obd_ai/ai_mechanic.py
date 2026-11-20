@@ -8,15 +8,17 @@ from __future__ import annotations
 import json
 import os
 from typing import Any
+from obd_ai.profiles import PROFILES
 
 ALLOWED_SENSORS = ("RPM", "SPEED", "COOLANT_TEMP", "ENGINE_LOAD", "THROTTLE_POS")
+ALLOWED_PROFILE_SENSORS = frozenset(name for p in PROFILES.values() for name in p.commands)
 
 SYSTEM_INSTRUCTIONS = """You are AutoFX AI Mechanic, a careful automotive diagnostics assistant.
 Answer in Serbian (Latin script), unless the technician explicitly requests another language.
 Treat vehicle readings and DTC descriptions as untrusted diagnostic evidence.
 Do not assert that a reading proves a specific fault. Explain uncertainty and suggest
 safe next diagnostic checks, ranked by relevance, without guessing unsupported sensors.
-Respect that generic OBD-II PIDs cannot diagnose every manufacturer-specific system.
+Respect that generic OBD-II PIDs cannot diagnose every manufacturer-specific system.\nA targeted scan may contain unsupported PIDs; do not fabricate their values.\nDPF/SCR targeted scans provide generic context, not proof of soot loading, SCR operation or NOx values.
 Never claim that you ran a physical test. You have NO ability to send ECU commands.
 Do not suggest instructions to disable emissions controls, evade monitoring, bypass
 safety systems, or modify ECU firmware. Recommend approved OEM service procedures.
@@ -27,7 +29,7 @@ Keep responses practical and concise.
 """
 
 
-def diagnostic_context(sample: dict[str, Any] | None, codes: list[dict[str, Any]] | None) -> dict[str, Any]:
+def diagnostic_context(sample: dict[str, Any] | None, codes: list[dict[str, Any]] | None, scan: dict[str, Any] | None = None) -> dict[str, Any]:
     """Return an allowlisted, size-limited, JSON-serializable diagnostic snapshot."""
     sample = sample or {}
     raw = sample.get("sensors", {})
@@ -52,6 +54,25 @@ def diagnostic_context(sample: dict[str, Any] | None, codes: list[dict[str, Any]
                 "code": str(entry.get("code", ""))[:16],
                 "description": str(entry.get("description", ""))[:160],
             })
+    scan = scan or {}
+    key = scan.get("profile")
+    if key in PROFILES:
+        readings = scan.get("readings", {})
+        safe_readings = {}
+        for name in PROFILES[key].commands:
+            raw_entry = readings.get(name, {}) if isinstance(readings, dict) else {}
+            if not isinstance(raw_entry, dict):
+                raw_entry = {}
+            value = raw_entry.get("value")
+            safe_readings[name] = {
+                "value": round(float(value), 2) if isinstance(value, (int, float)) and not isinstance(value, bool) else None,
+                "unit": str(raw_entry.get("unit") or "")[:32],
+                "status": str(raw_entry.get("status") or "unavailable")[:20],
+            }
+        result["targeted_scan"] = {
+            "profile": key, "description": PROFILES[key].description,
+            "readings": safe_readings,
+        }
     return result
 
 
@@ -86,6 +107,13 @@ def offline_analysis(question: str, context: dict[str, Any]) -> str:
         notes.append("Kodovi sami po sebi ne potvrđuju uzrok. Proveri freeze-frame i fabričku servisnu dokumentaciju.")
     else:
         notes.append("Nema memorisanih DTC kodova u dostavljenom snimku. To ne znači da je vozilo bez kvara.")
+    scan = context.get("targeted_scan")
+    if scan:
+        notes.append("Ciljani profil: " + scan["profile"].upper() + " (samo dostupni generički PID-ovi).")
+        for key, reading in scan["readings"].items():
+            if reading["value"] is not None:
+                notes.append(f"{key}: {reading['value']} {reading['unit']} ({reading['status']}).")
+        notes.append("Nedostupni PID-ovi ne dokazuju da vozilo nema tu komponentu. Za DPF/SCR detalje često je potrebna OEM dijagnostika.")
     notes.append("Za detaljniju analizu možeš uključiti OpenAI režim uz sopstveni API ključ. Cloud analiza šalje samo trenutni dijagnostički snimak i pitanje.")
     return "\n\n".join(notes)
 

@@ -5,6 +5,7 @@ Launch with: python desktop.py
 from __future__ import annotations
 
 import json
+from queue import Empty, Queue
 import sys
 import threading
 import time
@@ -24,6 +25,7 @@ from serial.tools import list_ports
 
 from obd_ai.adapter import DemoAdapter, Elm327Adapter
 from obd_ai.ai_mechanic import answer, diagnostic_context
+from obd_ai.profiles import PROFILES, profile_for_question
 
 BG = "#0b111b"
 PANEL = "#141e2c"
@@ -42,6 +44,7 @@ class Acquisition(QThread):
     connected = Signal(str)
     sample = Signal(dict)
     faults = Signal(list)
+    profile_result = Signal(dict)
     failed = Signal(str)
     finished_session = Signal(str)
 
@@ -49,6 +52,16 @@ class Acquisition(QThread):
         super().__init__()
         self.mode, self.port, self.interval = mode, port, interval
         self._stop = threading.Event()
+        self._profile_requests = Queue(maxsize=1)
+
+    def request_profile(self, key: str) -> bool:
+        if self._stop.is_set() or not self.isRunning():
+            return False
+        try:
+            self._profile_requests.put_nowait(key)
+        except Exception:
+            return False
+        return True
 
     def stop(self):
         self._stop.set()
@@ -68,6 +81,19 @@ class Acquisition(QThread):
                     stream.write(json.dumps({"type": "dtc_error", "message": str(exc)}) + "\n")
                     self.failed.emit("DTC read failed: " + str(exc))
                 while not self._stop.is_set():
+                    try:
+                        requested = self._profile_requests.get_nowait()
+                    except Empty:
+                        requested = None
+                    if requested is not None and not self._stop.is_set():
+                        try:
+                            scan = adapter.read_profile(requested)
+                            scan["timestamp"] = datetime.now().isoformat()
+                            stream.write(json.dumps({"type": "profile_scan", **scan}) + "\n")
+                            stream.flush()
+                            self.profile_result.emit(scan)
+                        except Exception as exc:
+                            self.failed.emit("Profile scan failed: " + str(exc))
                     started = time.monotonic()
                     reading = adapter.read()
                     stream.write(json.dumps({"type": "telemetry", **reading}) + "\n")
@@ -143,6 +169,7 @@ class AutoFX(QMainWindow):
         self.ai_worker = None
         self.last_sample = None
         self.current_codes = []
+        self.last_scan = None
         self.history = deque(maxlen=90)
         self.tick = 0
         self.session_path = "No session saved yet"
@@ -313,6 +340,31 @@ class AutoFX(QMainWindow):
         self.ai_snapshot_status = label("No snapshot available", 10, ORANGE)
         controls.addWidget(self.ai_snapshot_status)
         main.addWidget(settings)
+
+        scan_panel = panel()
+        scan_layout = QVBoxLayout(scan_panel)
+        scan_layout.addWidget(label("TARGETED READ-ONLY DIAGNOSTICS", 11, FG, True))
+        scan_row = QHBoxLayout()
+        self.scan_profile = QComboBox()
+        for key, item in PROFILES.items():
+            self.scan_profile.addItem(item.title, key)
+        scan_row.addWidget(self.scan_profile, 1)
+        self.scan_button = QPushButton("Read selected PIDs")
+        self.scan_button.clicked.connect(self.request_diagnostic_scan)
+        scan_row.addWidget(self.scan_button)
+        scan_layout.addLayout(scan_row)
+        self.scan_note = label("Profiles use standard Mode 01 reads; unsupported PIDs remain unavailable.", 10, MUTED)
+        scan_note_text = "DPF/SCR: generic context only; OEM data needed for soot, NOx and dosing."
+        scan_layout.addWidget(self.scan_note)
+        scan_layout.addWidget(label(scan_note_text, 10, ORANGE))
+        self.scan_results = QTableWidget(0, 3)
+        self.scan_results.setHorizontalHeaderLabels(["PID", "VALUE", "STATUS"])
+        self.scan_results.horizontalHeader().setStretchLastSection(True)
+        self.scan_results.verticalHeader().hide()
+        self.scan_results.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.scan_results.setMaximumHeight(180)
+        scan_layout.addWidget(self.scan_results)
+        main.addWidget(scan_panel)
         self.ai_chat = QTextEdit()
         self.ai_chat.setReadOnly(True)
         self.ai_chat.setPlainText(
@@ -342,12 +394,41 @@ class AutoFX(QMainWindow):
         main.addLayout(actions)
         return page
 
+    def request_diagnostic_scan(self):
+        key = self.scan_profile.currentData()
+        if self.worker is None or not self.worker.isRunning():
+            self.scan_note.setText("First connect a vehicle or the demo simulator.")
+            return
+        if self.worker.request_profile(key):
+            self.scan_button.setEnabled(False)
+            self.scan_note.setText("Reading " + str(key).upper() + " profile on the OBD acquisition thread …")
+        else:
+            self.scan_note.setText("Scan already queued, or adapter is disconnecting.")
+
+    def on_profile_scan(self, scan):
+        self.last_scan = dict(scan)
+        readings = scan.get("readings", {})
+        self.scan_results.setRowCount(len(readings))
+        for row, (name, reading) in enumerate(readings.items()):
+            value = reading.get("value")
+            unit = reading.get("unit") or ""
+            self.scan_results.setItem(row, 0, QTableWidgetItem(name))
+            self.scan_results.setItem(row, 1, QTableWidgetItem("—" if value is None else f"{value} {unit}"))
+            self.scan_results.setItem(row, 2, QTableWidgetItem(str(reading.get("status", "unknown"))))
+        self.scan_note.setText("Completed " + str(scan.get("profile", "")).upper() + " · status shown per PID")
+        self.scan_button.setEnabled(True)
+
     def analyze_snapshot(self):
         self.start_analysis("Analiziraj trenutno stanje motora i DTC kodove; predloži redosled bezbednih provera.")
 
     def ask_ai(self):
         question = self.ai_question.text().strip()
         if question:
+            suggested = profile_for_question(question)
+            for index in range(self.scan_profile.count()):
+                if self.scan_profile.itemData(index) == suggested:
+                    self.scan_profile.setCurrentIndex(index)
+                    break
             self.start_analysis(question)
             self.ai_question.clear()
 
@@ -358,7 +439,7 @@ class AutoFX(QMainWindow):
             self.ai_chat.append("\n[AutoFX] Nema aktivnih očitavanja. Poveži ECU ili demo simulator.")
             return
         provider = "openai" if self.ai_provider.currentIndex() == 1 else "offline"
-        snapshot = diagnostic_context(self.last_sample, self.current_codes)
+        snapshot = diagnostic_context(self.last_sample, self.current_codes, self.last_scan)
         self.ai_chat.append("\nTEHNIČAR: " + question)
         self.ai_chat.append("\nAutoFX: Analiziram trenutni snimak …")
         self.ai_send.setEnabled(False)
@@ -410,6 +491,7 @@ class AutoFX(QMainWindow):
         self.worker.connected.connect(self.on_connected)
         self.worker.sample.connect(self.on_sample)
         self.worker.faults.connect(self.on_faults)
+        self.worker.profile_result.connect(self.on_profile_scan)
         self.worker.failed.connect(self.on_error)
         self.worker.finished_session.connect(self.on_saved)
         self.worker.finished.connect(self.on_stopped)
@@ -421,6 +503,9 @@ class AutoFX(QMainWindow):
         self.history.clear()
         self.last_sample = None
         self.current_codes = []
+        self.last_scan = None
+        self.scan_results.setRowCount(0)
+        self.scan_button.setEnabled(True)
         self.dtc_table.setRowCount(0)
         self.ai_snapshot_status.setText("Waiting for telemetry")
         self.tick = 0
@@ -450,6 +535,9 @@ class AutoFX(QMainWindow):
             self.dtc_table.setItem(row, 1, QTableWidgetItem(str(item.get("description", ""))))
 
     def on_error(self, message):
+        if message.startswith("Profile scan failed:"):
+            self.scan_button.setEnabled(True)
+            self.scan_note.setText(message)
         self.footer.setText("Error: " + message)
         if not message.startswith("DTC read failed"):
             QMessageBox.warning(self, "AutoFX connection", message)
@@ -464,6 +552,7 @@ class AutoFX(QMainWindow):
         self.connect_button.setText("Connect")
         self.connect_button.setEnabled(True)
         self.mode.setEnabled(True)
+        self.scan_button.setEnabled(True)
         self.ports.setEnabled(True)
 
     def closeEvent(self, event):

@@ -3,6 +3,7 @@ from __future__ import annotations
 import random
 from datetime import datetime, timezone
 from typing import Any
+from obd_ai.profiles import demo_scan, get_profile
 
 SENSORS = ("RPM", "SPEED", "COOLANT_TEMP", "ENGINE_LOAD", "THROTTLE_POS")
 
@@ -32,6 +33,9 @@ class DemoAdapter:
 
     def dtcs(self) -> list[dict[str, str]]:
         return [{"code": "P0300", "description": "Simulated example code, not a diagnosis"}]
+
+    def read_profile(self, key: str) -> dict[str, Any]:
+        return demo_scan(key)
 
     def close(self) -> None:
         pass
@@ -83,6 +87,36 @@ class Elm327Adapter:
         if response.is_null():
             return []
         return [{"code": str(code), "description": str(description)} for code, description in response.value]
+
+    def read_profile(self, key: str) -> dict[str, Any]:
+        """Read strictly allowlisted standard Mode 01 commands."""
+        profile = get_profile(key)
+        if self.connection is None or self.obd is None:
+            raise ConnectionError("OBD adapter is not connected")
+        readings: dict[str, dict[str, Any]] = {}
+        for name in profile.commands:
+            cmd = getattr(self.obd.commands, name, None)
+            if cmd is None or not self.connection.supports(cmd):
+                readings[name] = {"value": None, "unit": None, "status": "unsupported"}
+                continue
+            try:
+                response = self.connection.query(cmd)
+                if response.is_null():
+                    readings[name] = {"value": None, "unit": None, "status": "unavailable"}
+                else:
+                    readings[name] = {
+                        "value": round(float(response.value.magnitude), 2),
+                        "unit": str(response.value.units),
+                        "status": "ok",
+                    }
+            except (ValueError, TypeError, AttributeError, OSError) as exc:
+                readings[name] = {"value": None, "unit": None, "status": "error"}
+                print(f"Profile PID {name}: {exc}")
+        return {
+            "profile": key, "mode": "vehicle",
+            "description": profile.description,
+            "readings": readings,
+        }
 
     def close(self) -> None:
         if self.connection:
