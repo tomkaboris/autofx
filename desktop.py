@@ -43,6 +43,7 @@ class Acquisition(QThread):
     """Keep all serial queries off the GUI thread; never issue ECU writes."""
 
     connected = Signal(str)
+    identification = Signal(dict)
     sample = Signal(dict)
     faults = Signal(list)
     profile_result = Signal(dict)
@@ -83,6 +84,11 @@ class Acquisition(QThread):
         output = Path("logs") / ("desktop-" + datetime.now().strftime("%Y%m%d-%H%M%S") + ".jsonl")
         try:
             self.connected.emit(adapter.connect())
+            try:
+                # VIN stays in memory, not in JSONL session logs or AI requests.
+                self.identification.emit(adapter.identify_vehicle())
+            except Exception as exc:
+                self.failed.emit("Vehicle identification unavailable: " + str(exc))
             output.parent.mkdir(parents=True, exist_ok=True)
             with output.open("a", encoding="utf-8") as stream:
                 try:
@@ -208,8 +214,14 @@ class AutoFX(QMainWindow):
         self.worker = None
         self.ai_worker = None
         self.last_sample = None
+        self.vehicle_identity = None
+        for field in self.identity_fields.values():
+            field.setText("Unavailable")
+        self.identity_pids.setRowCount(0)
+        self.identity_note.setText("Waiting for real ECU identity; no values are inferred.")
         self.current_codes = []
         self.last_scan = None
+        self.vehicle_identity = None
         self.last_sample_received = 0.0
         self.history = deque(maxlen=90)
         self.tick = 0
@@ -235,7 +247,7 @@ class AutoFX(QMainWindow):
         nav.addWidget(label("AUTOMOTIVE DIAGNOSTICS", 9, MUTED, True))
         nav.addSpacing(30)
         self.nav_buttons = []
-        for name in ("Overview", "Diagnostics", "Sessions", "AI Assistant"):
+        for name in ("Overview", "Vehicle", "Diagnostics", "Sessions", "AI Assistant"):
             b = QPushButton(name)
             b.setProperty("nav", True)
             b.setCursor(Qt.PointingHandCursor)
@@ -284,6 +296,7 @@ class AutoFX(QMainWindow):
 
         self.pages = QStackedWidget()
         self.pages.addWidget(self.overview_page())
+        self.pages.addWidget(self.vehicle_page())
         self.pages.addWidget(self.diagnostics_page())
         self.pages.addWidget(self.sessions_page())
         self.pages.addWidget(self.ai_page())
@@ -333,6 +346,62 @@ class AutoFX(QMainWindow):
         graph_layout.addWidget(self.graph)
         main.addWidget(chart_box, 1)
         return page
+
+    def vehicle_page(self):
+        page = QWidget()
+        main = QVBoxLayout(page)
+        main.setContentsMargins(0, 0, 0, 0)
+        main.setSpacing(14)
+        main.addWidget(label("Vehicle & ECU identification", 19, FG, True))
+        main.addWidget(label("Live Mode 09 identity and ECU-advertised generic PID support", 11, MUTED))
+        card = panel()
+        details = QGridLayout(card)
+        details.setContentsMargins(18, 18, 18, 18)
+        self.identity_fields = {}
+        names = (
+            ("vin", "VIN"), ("vin_status", "VIN status"),
+            ("protocol", "OBD protocol"), ("port", "Adapter port"),
+            ("calibration_id", "Calibration ID"), ("calibration_verification", "CVN"),
+        )
+        for row, (key, title) in enumerate(names):
+            details.addWidget(label(title, 11, MUTED), row, 0)
+            value = label("Unavailable", 12, FG)
+            value.setWordWrap(True)
+            self.identity_fields[key] = value
+            details.addWidget(value, row, 1)
+        details.setColumnStretch(1, 1)
+        main.addWidget(card)
+        main.addWidget(label("GENERIC MODE 01 PID SUPPORT", 11, FG, True))
+        self.identity_pids = QTableWidget(0, 2)
+        self.identity_pids.setHorizontalHeaderLabels(["PID", "ADVERTISED SUPPORT"])
+        self.identity_pids.horizontalHeader().setStretchLastSection(True)
+        self.identity_pids.verticalHeader().hide()
+        self.identity_pids.setEditTriggers(QTableWidget.NoEditTriggers)
+        main.addWidget(self.identity_pids, 1)
+        self.identity_note = label(
+            "Connect to a real ECU. No VIN, ECU ID or capabilities are inferred.", 11, ORANGE
+        )
+        self.identity_note.setWordWrap(True)
+        main.addWidget(self.identity_note)
+        return page
+
+    def on_identification(self, result):
+        self.vehicle_identity = dict(result)
+        for key, field in self.identity_fields.items():
+            field.setText(str(result.get(key) or "Unavailable"))
+        pids = result.get("supported_pids", {})
+        self.identity_pids.setRowCount(len(pids))
+        for row, (pid, supported) in enumerate(sorted(pids.items())):
+            self.identity_pids.setItem(row, 0, QTableWidgetItem(pid))
+            self.identity_pids.setItem(row, 1, QTableWidgetItem(
+                "Supported" if supported else "Not advertised / unsupported"
+            ))
+        self.identity_note.setText(
+            f"Available generic PIDs: {result.get('supported_count', 0)} / "
+            f"{result.get('total_checked', 0)} checked. "
+            "This is not a full OEM ECU/module inventory. "
+            "VIN is displayed locally and is not sent to AI by default."
+        )
 
     def diagnostics_page(self):
         page = QWidget()
@@ -411,7 +480,7 @@ class AutoFX(QMainWindow):
         code = self.current_codes[row]
         question = ("Objasni DTC " + str(code.get("code", "")) +
                     " i njegove moguće uzroke. Predloži bezbedne servisne provere pre brisanja.")
-        self.show_page(3)
+        self.show_page(4)
         self.start_analysis(question)
 
     def confirm_clear_dtcs(self):
@@ -635,6 +704,7 @@ class AutoFX(QMainWindow):
             return
         self.worker = Acquisition(port)
         self.worker.connected.connect(self.on_connected)
+        self.worker.identification.connect(self.on_identification)
         self.worker.sample.connect(self.on_sample)
         self.worker.faults.connect(self.on_faults)
         self.worker.profile_result.connect(self.on_profile_scan)
@@ -686,7 +756,7 @@ class AutoFX(QMainWindow):
             self.scan_button.setEnabled(True)
             self.scan_note.setText(message)
         self.footer.setText("Error: " + message)
-        if not message.startswith("DTC read failed"):
+        if not (message.startswith("DTC read failed") or message.startswith("Vehicle identification unavailable:")):
             QMessageBox.warning(self, "AutoFX connection", message)
 
     def on_saved(self, path):
@@ -694,6 +764,11 @@ class AutoFX(QMainWindow):
         self.sessions_text.append("\nSaved: " + path)
 
     def on_stopped(self):
+        self.vehicle_identity = None
+        for field in self.identity_fields.values():
+            field.setText("Unavailable")
+        self.identity_pids.setRowCount(0)
+        self.identity_note.setText("Disconnected. Connect a real ECU to read identity.")
         self.dtc_clear_button.setEnabled(True)
         self.status.setText("●  DISCONNECTED")
         self.status.setStyleSheet("color: " + MUTED + ";")
