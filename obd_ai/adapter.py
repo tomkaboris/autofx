@@ -1,4 +1,4 @@
-"""Read-only OBD-II adapter and demo simulator."""
+"""ELM327 OBD-II adapter for actual vehicle diagnostics."""
 from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
