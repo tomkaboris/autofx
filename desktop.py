@@ -18,7 +18,7 @@ from PySide6.QtCore import QThread, Qt, Signal
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel,
-    QLineEdit, QMainWindow, QMessageBox, QPushButton, QStackedWidget, QTableWidget,
+    QInputDialog, QLineEdit, QMainWindow, QMessageBox, QPushButton, QStackedWidget, QTableWidget,
     QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
 )
 from serial.tools import list_ports
@@ -26,6 +26,7 @@ from serial.tools import list_ports
 from obd_ai.adapter import DemoAdapter, Elm327Adapter
 from obd_ai.ai_mechanic import answer, diagnostic_context
 from obd_ai.profiles import PROFILES, profile_for_question
+from obd_ai.service_operations import CONFIRMATION_TEXT, OperationDenied, operation_description, validate_clear_request
 
 BG = "#0b111b"
 PANEL = "#141e2c"
@@ -45,6 +46,7 @@ class Acquisition(QThread):
     sample = Signal(dict)
     faults = Signal(list)
     profile_result = Signal(dict)
+    service_result = Signal(dict)
     failed = Signal(str)
     finished_session = Signal(str)
 
@@ -53,6 +55,7 @@ class Acquisition(QThread):
         self.mode, self.port, self.interval = mode, port, interval
         self._stop = threading.Event()
         self._profile_requests = Queue(maxsize=1)
+        self._service_requests = Queue(maxsize=1)
 
     def request_profile(self, key: str) -> bool:
         if self._stop.is_set() or not self.isRunning():
@@ -62,6 +65,15 @@ class Acquisition(QThread):
         except Exception:
             return False
         return True
+
+    def request_service(self, authorization: dict) -> bool:
+        if self._stop.is_set() or not self.isRunning():
+            return False
+        try:
+            self._service_requests.put_nowait(dict(authorization))
+            return True
+        except Exception:
+            return False
 
     def stop(self):
         self._stop.set()
@@ -81,6 +93,34 @@ class Acquisition(QThread):
                     stream.write(json.dumps({"type": "dtc_error", "message": str(exc)}) + "\n")
                     self.failed.emit("DTC read failed: " + str(exc))
                 while not self._stop.is_set():
+                    try:
+                        service_request = self._service_requests.get_nowait()
+                    except Empty:
+                        service_request = None
+                    if service_request is not None and not self._stop.is_set():
+                        # Re-read immediately before the write; never trust stale GUI data.
+                        fresh = adapter.read()
+                        try:
+                            validate_clear_request(
+                                mode=self.mode, sample=fresh,
+                                confirmed=service_request.get("confirmed", False),
+                                text=service_request.get("text", ""),
+                            )
+                            before = adapter.dtcs()
+                            stream.write(json.dumps({"type": "service_before", "dtcs": before}) + "\n")
+                            stream.flush()
+                            result = adapter.clear_emissions_dtcs()
+                            result["before"] = before
+                        except Exception as exc:
+                            result = {"operation": "clear_emissions_dtc_mode04",
+                                      "mode": self.mode, "result": "denied_or_failed",
+                                      "error": str(exc)}
+                        result["timestamp"] = datetime.now().isoformat()
+                        stream.write(json.dumps({"type": "service_result", **result}) + "\n")
+                        stream.flush()
+                        self.service_result.emit(result)
+                        if result.get("after") is not None:
+                            self.faults.emit(result["after"])
                     try:
                         requested = self._profile_requests.get_nowait()
                     except Empty:
@@ -170,6 +210,7 @@ class AutoFX(QMainWindow):
         self.last_sample = None
         self.current_codes = []
         self.last_scan = None
+        self.last_sample_received = 0.0
         self.history = deque(maxlen=90)
         self.tick = 0
         self.session_path = "No session saved yet"
@@ -203,7 +244,7 @@ class AutoFX(QMainWindow):
             nav.addWidget(b)
         nav.addStretch()
         nav.addWidget(label("ENGINEERING WORKSTATION", 9, MUTED))
-        nav.addWidget(label("v0.3 · READ ONLY", 10, GREEN, True))
+        nav.addWidget(label("v0.5 · SERVICE WORKSPACE", 10, GREEN, True))
         row.addWidget(sidebar)
 
         workspace = QWidget()
@@ -300,16 +341,125 @@ class AutoFX(QMainWindow):
         page = QWidget()
         main = QVBoxLayout(page)
         main.setContentsMargins(0, 0, 0, 0)
-        main.addWidget(label("Stored diagnostic trouble codes", 17, FG, True))
-        main.addWidget(label("Codes are read at connection time. No ECU commands modify vehicle state.", 11, MUTED))
+        main.setSpacing(12)
+        main.addWidget(label("DTC Service Workspace", 19, FG, True))
+        main.addWidget(label("Select a code to inspect it. Mode 04 clearing affects all supported emissions-related DTCs.", 11, MUTED))
         self.dtc_table = QTableWidget(0, 2)
         self.dtc_table.setHorizontalHeaderLabels(["CODE", "DESCRIPTION"])
         self.dtc_table.horizontalHeader().setStretchLastSection(True)
         self.dtc_table.setAlternatingRowColors(True)
+        self.dtc_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.dtc_table.setSelectionMode(QTableWidget.SingleSelection)
         self.dtc_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.dtc_table.verticalHeader().hide()
-        main.addWidget(self.dtc_table, 1)
+        self.dtc_table.itemSelectionChanged.connect(self.show_dtc_detail)
+        main.addWidget(self.dtc_table, 2)
+
+        details = panel()
+        details_layout = QVBoxLayout(details)
+        details_layout.addWidget(label("SELECTED FAULT", 10, MUTED, True))
+        self.dtc_title = label("No DTC selected", 15, FG, True)
+        details_layout.addWidget(self.dtc_title)
+        self.dtc_detail = label("Select a row above to see diagnostic guidance.", 11, MUTED)
+        self.dtc_detail.setWordWrap(True)
+        details_layout.addWidget(self.dtc_detail)
+        ask_row = QHBoxLayout()
+        self.dtc_ask_ai = QPushButton("Discuss selected code with AI")
+        self.dtc_ask_ai.clicked.connect(self.ask_selected_dtc)
+        ask_row.addWidget(self.dtc_ask_ai)
+        ask_row.addStretch()
+        details_layout.addLayout(ask_row)
+        main.addWidget(details, 1)
+
+        service = panel()
+        service_layout = QVBoxLayout(service)
+        service_layout.addWidget(label("SERVICE OPERATION · GLOBAL DTC CLEAR", 11, ORANGE, True))
+        service_description = label(
+            "Mode 04 clears ALL supported emission-related codes, may erase freeze frames and resets readiness. "
+            "It does not selectively erase this row. Engine OFF and vehicle stationary required.", 11, MUTED
+        )
+        service_description.setWordWrap(True)
+        service_layout.addWidget(service_description)
+        service_actions = QHBoxLayout()
+        self.dtc_clear_button = QPushButton("Clear emissions DTCs (Mode 04)")
+        self.dtc_clear_button.clicked.connect(self.confirm_clear_dtcs)
+        service_actions.addWidget(self.dtc_clear_button)
+        service_actions.addStretch()
+        service_layout.addLayout(service_actions)
+        self.service_note = label("Operator confirmation + fresh RPM=0 / SPEED=0 required.", 10, ORANGE)
+        self.service_note.setWordWrap(True)
+        service_layout.addWidget(self.service_note)
+        main.addWidget(service)
         return page
+
+    def show_dtc_detail(self):
+        row = self.dtc_table.currentRow()
+        if not (0 <= row < len(self.current_codes)):
+            self.dtc_title.setText("No DTC selected")
+            self.dtc_detail.setText("Select a stored DTC to inspect it.")
+            return
+        code = self.current_codes[row]
+        self.dtc_title.setText(str(code.get("code", "Unknown")))
+        self.dtc_detail.setText(
+            str(code.get("description", "No description available")) +
+            "\nSuggested workflow: save the diagnostic session, inspect related live data, "
+            "consult manufacturer procedures, and verify the repair. A DTC is not proof of one specific cause."
+        )
+
+    def ask_selected_dtc(self):
+        row = self.dtc_table.currentRow()
+        if not (0 <= row < len(self.current_codes)):
+            QMessageBox.information(self, "Select a DTC", "Choose a fault in the table first.")
+            return
+        code = self.current_codes[row]
+        question = ("Objasni DTC " + str(code.get("code", "")) +
+                    " i njegove moguće uzroke. Predloži bezbedne servisne provere pre brisanja.")
+        self.show_page(3)
+        self.start_analysis(question)
+
+    def confirm_clear_dtcs(self):
+        if self.worker is None or not self.worker.isRunning():
+            QMessageBox.warning(self, "No ECU", "Connect a vehicle or Demo simulator first.")
+            return
+        if self.last_sample is None:
+            QMessageBox.warning(self, "No live reading", "Wait for current RPM and SPEED readings.")
+            return
+        consent = QMessageBox.warning(
+            self, "Confirm global OBD-II Mode 04",
+            operation_description() + "\n\nOnly continue after documenting current faults. Is the engine OFF?",
+            QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel,
+        )
+        if consent != QMessageBox.Yes:
+            return
+        typed, ok = QInputDialog.getText(
+            self, "Second confirmation",
+            "Type CLEAR ALL to authorize one global emissions-related DTC clear:"
+        )
+        if not ok:
+            return
+        try:
+            validate_clear_request(mode=self.worker.mode, sample=self.last_sample,
+                                   confirmed=True, text=typed)
+        except OperationDenied as exc:
+            QMessageBox.warning(self, "Operation blocked", str(exc))
+            return
+        if not self.worker.request_service({"confirmed": True, "text": typed}):
+            QMessageBox.warning(self, "Busy", "Another service operation is pending.")
+            return
+        self.dtc_clear_button.setEnabled(False)
+        self.service_note.setText("Service request queued. ECU state will be rechecked before execution.")
+
+    def on_service_result(self, result):
+        self.dtc_clear_button.setEnabled(True)
+        message = ("Mode 04: " + str(result.get("result", "unknown")) +
+                   (". " + str(result.get("error")) if result.get("error") else "") +
+                   ". Inspect the new DTC reading to verify the outcome.")
+        self.service_note.setText(message)
+        self.sessions_text.append("\nSERVICE: " + json.dumps(result, ensure_ascii=False))
+        if result.get("error"):
+            QMessageBox.warning(self, "Service result", message)
+        else:
+            QMessageBox.information(self, "Service result", message)
 
     def sessions_page(self):
         page = QWidget()
@@ -492,6 +642,7 @@ class AutoFX(QMainWindow):
         self.worker.sample.connect(self.on_sample)
         self.worker.faults.connect(self.on_faults)
         self.worker.profile_result.connect(self.on_profile_scan)
+        self.worker.service_result.connect(self.on_service_result)
         self.worker.failed.connect(self.on_error)
         self.worker.finished_session.connect(self.on_saved)
         self.worker.finished.connect(self.on_stopped)
@@ -504,6 +655,7 @@ class AutoFX(QMainWindow):
         self.last_sample = None
         self.current_codes = []
         self.last_scan = None
+        self.dtc_clear_button.setEnabled(True)
         self.scan_results.setRowCount(0)
         self.scan_button.setEnabled(True)
         self.dtc_table.setRowCount(0)
@@ -547,6 +699,7 @@ class AutoFX(QMainWindow):
         self.sessions_text.append("\nSaved: " + path)
 
     def on_stopped(self):
+        self.dtc_clear_button.setEnabled(True)
         self.status.setText("●  DISCONNECTED")
         self.status.setStyleSheet("color: " + MUTED + ";")
         self.connect_button.setText("Connect")
