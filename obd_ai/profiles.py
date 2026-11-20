@@ -62,25 +62,3 @@ def get_profile(key: str) -> DiagnosticProfile:
     return PROFILES[key]
 
 
-def demo_scan(key: str) -> dict:
-    """Simulated profile scan with unsupported signals explicitly represented."""
-    profile = get_profile(key)
-    dummy = {
-        "RPM": (780, "rpm"), "SPEED": (0, "km/h"),
-        "COOLANT_TEMP": (87, "degree_Celsius"), "ENGINE_LOAD": (21, "percent"),
-        "THROTTLE_POS": (12, "percent"), "INTAKE_PRESSURE": (37, "kilopascal"),
-        "INTAKE_TEMP": (28, "degree_Celsius"), "MAF": (7.4, "gram / second"),
-        "FUEL_PRESSURE": (320, "kilopascal"), "BAROMETRIC_PRESSURE": (100, "kilopascal"),
-        "COMMANDED_EGR": (14, "percent"), "EGR_ERROR": (-2, "percent"),
-        "CATALYST_TEMP_B1S1": (240, "degree_Celsius"),
-        "CATALYST_TEMP_B1S2": (220, "degree_Celsius"),
-        "FUEL_RATE": (0.8, "liter / hour"),
-    }
-    return {
-        "profile": key, "mode": "demo", "description": profile.description,
-        "readings": {
-            name: {"value": dummy[name][0], "unit": dummy[name][1], "status": "simulated"}
-            if name in dummy else {"value": None, "unit": None, "status": "unsupported"}
-            for name in profile.commands
-        },
-    }
