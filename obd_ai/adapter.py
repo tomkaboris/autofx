@@ -14,6 +14,7 @@ def timestamp() -> str:
 class DemoAdapter:
     def __init__(self) -> None:
         self.step = 0
+        self.engine_running = True
         self.demo_codes = [{"code": "P0300", "description": "Simulated misfire example, not a diagnosis"}]
 
     def connect(self) -> str:
@@ -24,7 +25,7 @@ class DemoAdapter:
         return {
             "timestamp": timestamp(), "mode": "demo",
             "sensors": {
-                "RPM": round(760 + random.uniform(-35, 35), 1),
+                "RPM": round(760 + random.uniform(-35, 35), 1) if self.engine_running else 0,
                 "SPEED": 0,
                 "COOLANT_TEMP": 85 + random.randint(-2, 2),
                 "ENGINE_LOAD": round(19 + random.uniform(-3, 3), 1),
