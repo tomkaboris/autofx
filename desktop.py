@@ -215,13 +215,8 @@ class AutoFX(QMainWindow):
         self.ai_worker = None
         self.last_sample = None
         self.vehicle_identity = None
-        for field in self.identity_fields.values():
-            field.setText("Unavailable")
-        self.identity_pids.setRowCount(0)
-        self.identity_note.setText("Waiting for real ECU identity; no values are inferred.")
         self.current_codes = []
         self.last_scan = None
-        self.vehicle_identity = None
         self.last_sample_received = 0.0
         self.history = deque(maxlen=90)
         self.tick = 0
@@ -718,6 +713,11 @@ class AutoFX(QMainWindow):
         self.footer.setText("Opening OBD connection …")
         self.history.clear()
         self.last_sample = None
+        self.vehicle_identity = None
+        for field in self.identity_fields.values():
+            field.setText("Unavailable")
+        self.identity_pids.setRowCount(0)
+        self.identity_note.setText("Waiting for real ECU identity; no values are inferred.")
         self.current_codes = []
         self.last_scan = None
         self.dtc_clear_button.setEnabled(True)
