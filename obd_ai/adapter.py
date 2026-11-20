@@ -4,6 +4,7 @@ import random
 from datetime import datetime, timezone
 from typing import Any
 from obd_ai.profiles import demo_scan, get_profile
+from obd_ai.service_operations import ACTION_NAME
 
 SENSORS = ("RPM", "SPEED", "COOLANT_TEMP", "ENGINE_LOAD", "THROTTLE_POS")
 
@@ -13,6 +14,7 @@ def timestamp() -> str:
 class DemoAdapter:
     def __init__(self) -> None:
         self.step = 0
+        self.demo_codes = [{"code": "P0300", "description": "Simulated misfire example, not a diagnosis"}]
 
     def connect(self) -> str:
         return "DEMO - simulated vehicle (not a real ECU)"
@@ -32,7 +34,14 @@ class DemoAdapter:
         }
 
     def dtcs(self) -> list[dict[str, str]]:
-        return [{"code": "P0300", "description": "Simulated example code, not a diagnosis"}]
+        return list(self.demo_codes)
+
+    def clear_emissions_dtcs(self) -> dict[str, Any]:
+        """Simulator only; always labeled as simulated."""
+        before = list(self.demo_codes)
+        self.demo_codes.clear()
+        return {"operation": ACTION_NAME, "mode": "demo", "result": "simulated",
+                "before": before, "after": [], "response_confirmed": True}
 
     def read_profile(self, key: str) -> dict[str, Any]:
         return demo_scan(key)
@@ -87,6 +96,28 @@ class Elm327Adapter:
         if response.is_null():
             return []
         return [{"code": str(code), "description": str(description)} for code, description in response.value]
+
+    def clear_emissions_dtcs(self) -> dict[str, Any]:
+        """Explicit Mode 04 service operation; never called autonomously.
+
+        The transport response alone does not prove all codes were erased.
+        Return a post-command re-read for operator interpretation.
+        """
+        if self.connection is None or self.obd is None or not self.connection.is_connected():
+            raise ConnectionError("ECU is not connected")
+        command = self.obd.commands.CLEAR_DTC
+        # python-OBD marks CLEAR_DTC as not discoverable via the PID mask.
+        # This explicit path is available only through the guarded service UI.
+        self.connection.query(command, force=True)
+        try:
+            after = self.dtcs()
+        except Exception as exc:
+            return {"operation": ACTION_NAME, "mode": "vehicle",
+                    "result": "unverified", "after": None, "error": str(exc),
+                    "response_confirmed": False}
+        return {"operation": ACTION_NAME, "mode": "vehicle",
+                "result": "rechecked", "after": after,
+                "response_confirmed": False}
 
     def read_profile(self, key: str) -> dict[str, Any]:
         """Read strictly allowlisted standard Mode 01 commands."""
